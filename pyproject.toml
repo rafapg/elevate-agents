@@ -1,0 +1,54 @@
+[project]
+name = "elevate-agents-lab"
+version = "0.1.0"
+description = "Laboratório offline e observável da Aula 12: Desenvolvimento de Agentes"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "langfuse>=4,<5",
+  "pydantic-ai-slim[openai]>=2.27,<3",
+  "pydantic-settings>=2.0,<3",
+]
+
+[project.scripts]
+aula12-agents = "aula12_agents.interfaces.cli:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.0,<2",
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.0,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aula12_agents"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+markers = [
+  "integration: teste de adapter de infraestrutura",
+  "provider: teste opt-in contra provider externo",
+  "slow: teste que não roda no caminho rápido",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "PT", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = true
+warn_unused_configs = true
+show_error_codes = true
+pretty = true

@@ -1,0 +1,31 @@
+# Local configuration and secrets. Keep the documented template public.
+.env
+.env.*
+!.env.example
+
+# Local virtual environments and Python tooling caches.
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Local runtime artefacts. Fixture JSONL files remain versionable outside runs/.
+runs/
+artifacts/
+poc-pydanticai/
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Coverage reports are generated locally or by CI.
+.coverage
+coverage.xml
+htmlcov/

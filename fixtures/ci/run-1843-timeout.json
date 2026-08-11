@@ -1,0 +1,15 @@
+{
+  "run_id": "1843",
+  "workflow": "checkout-regression-replay",
+  "status": "timed_out",
+  "started_at": "2026-08-08T09:17:00Z",
+  "finished_at": "2026-08-08T09:19:00Z",
+  "commit": "8f3a",
+  "summary": "Synthetic timeout injected while collecting the payment-return replay artifact.",
+  "retry_hint": "retry_once_after_checkpoint",
+  "coverage_notes": [
+    "no pass/fail conclusion is available from this run",
+    "timeout is an infrastructure condition, not evidence of a gateway failure"
+  ],
+  "contains_secrets": false
+}

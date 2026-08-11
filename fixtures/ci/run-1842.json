@@ -1,0 +1,16 @@
+{
+  "run_id": "1842",
+  "workflow": "checkout-unit-and-browser-smoke",
+  "status": "success",
+  "started_at": "2026-08-08T08:43:12Z",
+  "finished_at": "2026-08-08T08:48:05Z",
+  "commit": "8f3a",
+  "summary": "218 tests passed; browser smoke completed on Chromium and Firefox.",
+  "coverage_notes": [
+    "checkout completion tests cover a payment return with session_id",
+    "no test covers a payment return without session_id",
+    "Safari is not part of this fixture's browser matrix"
+  ],
+  "artifacts": ["unit.xml", "browser-smoke.json"],
+  "contains_secrets": false
+}
