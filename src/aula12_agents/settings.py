@@ -112,6 +112,21 @@ class LabSettings(BaseSettings):
         default=Path("runs/aula12.sqlite3"),
         validation_alias=AliasChoices("RUN_DB_PATH", "AULA12_RUN_DB_PATH"),
     )
+    coordination_run_timeout_seconds: int = Field(
+        default=300,
+        ge=60,
+        validation_alias=AliasChoices(
+            "COORDINATION_RUN_TIMEOUT_SECONDS", "AULA12_COORDINATION_RUN_TIMEOUT_SECONDS"
+        ),
+    )
+    ollama_coordination_timeout_seconds: int = Field(
+        default=180,
+        ge=60,
+        validation_alias=AliasChoices(
+            "OLLAMA_COORDINATION_TIMEOUT_SECONDS",
+            "AULA12_OLLAMA_COORDINATION_TIMEOUT_SECONDS",
+        ),
+    )
 
     def provider_settings(self) -> ProviderSettings:
         """Build the pre-existing provider adapter configuration without printing secrets."""

@@ -7,6 +7,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from aula12_agents.domain.models import (
+    CoordinationRun,
     CritiqueCard,
     EffectRecord,
     Evidence,
@@ -21,6 +22,10 @@ class CheckpointConflict(RuntimeError):
     """A stale worker attempted to advance a checkpoint revision."""
 
 
+class CoordinationConflict(RuntimeError):
+    """A stale worker attempted to advance a coordination task board."""
+
+
 class CheckpointStore(Protocol):
     def create(self, checkpoint: RunCheckpoint) -> RunCheckpoint: ...
 
@@ -29,6 +34,26 @@ class CheckpointStore(Protocol):
     def compare_and_swap(
         self, *, expected_revision: int, checkpoint: RunCheckpoint
     ) -> RunCheckpoint: ...
+
+
+class CoordinationStore(Protocol):
+    """Durable task-board storage, separate from the linear workflow store."""
+
+    def create(self, run: CoordinationRun) -> CoordinationRun: ...
+
+    def load(self, run_id: UUID) -> CoordinationRun: ...
+
+    def compare_and_swap(
+        self, *, expected_revision: int, run: CoordinationRun
+    ) -> CoordinationRun: ...
+
+
+class CoordinationEventSink(Protocol):
+    """Append-only operational events for a coordination run."""
+
+    def append(
+        self, *, run_id: UUID, event_type: str, payload_json: str, occurred_at: datetime
+    ) -> None: ...
 
 
 class RunEventSink(Protocol):

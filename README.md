@@ -4,6 +4,11 @@ Um laboratório executável para a Aula 12: workflow multiagente com evidências
 
 O projeto roda em modo `mock` por padrão: não requer chave de API, Ollama ou Langfuse para acompanhar a aula e executar os testes.
 
+## Arquitetura
+
+- [Arquitetura dos agentes e do workflow](docs/arquitetura-agentes.md): papéis, hand-offs Pydantic, gate, checkpoint, retomada e observabilidade.
+- [Arquitetura Clean/Hexagonal do repositório](docs/arquitetura-hexagonal.md): camadas, portas, adapters e composição pela CLI.
+
 ## Setup
 
 Requer Python 3.11 a 3.13 e [uv](https://docs.astral.sh/uv/).

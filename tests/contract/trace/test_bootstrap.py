@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import anyio
 import pytest
@@ -57,8 +58,17 @@ def test_client_construction_failure_preserves_the_jsonl_fallback(tmp_path: Path
 
 
 class _FakeObservation:
+    def __init__(self, client: _FakeLangfuse, *, parent: _FakeObservation | None) -> None:
+        self.client = client
+        self.parent = parent
+        self.ended = False
+
+    def start_observation(self, **kwargs: object) -> _FakeObservation:
+        self.client.observations.append({"parent": self, **kwargs})
+        return _FakeObservation(self.client, parent=self)
+
     def end(self) -> None:
-        pass
+        self.ended = True
 
 
 class _FakeLangfuse:
@@ -67,8 +77,8 @@ class _FakeLangfuse:
         self.flushed = False
 
     def start_observation(self, **kwargs: object) -> _FakeObservation:
-        self.observations.append(kwargs)
-        return _FakeObservation()
+        self.observations.append({"parent": None, **kwargs})
+        return _FakeObservation(self, parent=None)
 
     def flush(self) -> None:
         self.flushed = True
@@ -96,6 +106,56 @@ def test_one_provider_is_shared_by_native_pydantic_ai_and_custom_events(tmp_path
     assert bootstrap.remote_enabled
     assert instrumented_once is instrumented_twice
     assert client.observations[0]["name"] == "workflow.node.finished"
+
+
+def test_coordination_events_use_a_real_langfuse_root_and_keep_jsonl(tmp_path: Path) -> None:
+    client = _FakeLangfuse()
+
+    def factory(**_: object) -> _FakeLangfuse:
+        return client
+
+    settings = TraceSettings(
+        backend="both",
+        trace_dir=tmp_path,
+        langfuse_public_key="pk-lf-synthetic",
+        langfuse_secret_key="sk-lf-synthetic",
+        capture_content=False,
+    )
+    bootstrap = build_observability(settings, langfuse_factory=factory)
+    root = TraceEvent(
+        event_type="coordination.run.started",
+        occurred_at=datetime(2026, 8, 11, tzinfo=UTC),
+        trace_id="c" * 32,
+        span_id="d" * 16,
+        workflow_name="aula12-agents-coordination",
+        workflow_version="coordination-v1",
+        attributes={"scenario": "supervisor", "prompt": "not exported"},
+    )
+    child = root.model_copy(
+        update={
+            "event_type": "coordination.task.dispatched",
+            "span_id": "e" * 16,
+            "parent_span_id": root.span_id,
+            "attributes": {"task_id": "synthetic", "read_scope": ["search_commits"]},
+        }
+    )
+
+    bootstrap.sink.emit(root)
+    bootstrap.sink.emit(child)
+    bootstrap.sink.flush()
+
+    remote_root, remote_child = client.observations
+    assert remote_root["name"] == "coordination.run.started"
+    assert remote_root["parent"] is None
+    assert remote_child["name"] == "coordination.task.dispatched"
+    assert remote_child["parent"] is not None
+    assert "trace_context" not in remote_child
+    root_metadata = cast(dict[str, Any], remote_root["metadata"])
+    root_attributes = cast(dict[str, Any], root_metadata["attributes"])
+    assert root_attributes["prompt"] == "[CONTENT_NOT_CAPTURED]"
+    stored = (tmp_path / f"{'c' * 32}.jsonl").read_text(encoding="utf-8")
+    assert "not exported" not in stored
+    assert '"coordination.task.dispatched"' in stored
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,8 @@ def test_settings_defaults_to_secret_free_mock(monkeypatch, tmp_path) -> None:
     report = settings.doctor_report()
     assert report["model_provider"] == "mock"
     assert report["langfuse_credentials_configured"] is False
+    assert settings.coordination_run_timeout_seconds == 300
+    assert settings.ollama_coordination_timeout_seconds == 180
 
 
 def test_doctor_report_never_contains_openrouter_secret(tmp_path) -> None:

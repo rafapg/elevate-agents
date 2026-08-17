@@ -17,7 +17,11 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from aula12_agents.infrastructure.persistence import CheckpointNotFound
+from aula12_agents.domain.models import CoordinationRun
+from aula12_agents.infrastructure.persistence import (
+    CheckpointNotFound,
+    CoordinationRunNotFound,
+)
 from aula12_agents.infrastructure.trace.models import TraceEvent
 from aula12_agents.infrastructure.trace.sinks import TraceRedactor
 
@@ -141,3 +145,127 @@ class LocalRunInspector:
             yield connection
         finally:
             connection.close()
+
+
+class CoordinationRunInspector:
+    """Strictly read-only, export-safe views of a coordination task board.
+
+    ``SQLiteCoordinationStore`` owns writes and optimistic updates.  This
+    companion projection uses SQLite's ``mode=ro`` so inspecting a run cannot
+    create tables, advance a revision, or change the board being demonstrated.
+    """
+
+    def __init__(self, *, database_path: Path) -> None:
+        self._database_path = database_path
+
+    def task_board(self, run_id: UUID) -> dict[str, object]:
+        """Show task state and limits, never fixture bodies or report evidence IDs."""
+        run = self._load(run_id)
+        return {
+            "run_id": str(run.run_id),
+            "scenario": run.scenario.value,
+            "state": run.state.value,
+            "revision": run.revision,
+            "budget": {
+                "steps": run.budget_steps,
+                "spent_steps": run.spent_steps,
+                "reserved_steps": run.reserved_steps,
+            },
+            "coverage_target": run.coverage_target,
+            "deadline": run.deadline.isoformat(),
+            "decision": None
+            if run.decision is None
+            else {"kind": run.decision.kind.value, "task_id": _optional_uuid(run.decision.task_id)},
+            "tasks": [
+                {
+                    "task_id": str(task.task_id),
+                    "profile": task.profile.value,
+                    "status": task.status.value,
+                    "read_scope": list(task.read_scope),
+                    "budget_steps": task.budget_steps,
+                    "deadline": task.deadline.isoformat(),
+                    "depends_on": [str(parent_id) for parent_id in task.depends_on],
+                    "expected_revision": task.expected_revision,
+                    "revision": task.revision,
+                    "result": None
+                    if task.result is None
+                    else {
+                        "available": True,
+                        "evidence_count": len(task.result.evidence),
+                        "coverage": list(task.result.coverage),
+                    },
+                }
+                for task in run.tasks
+            ],
+        }
+
+    def events_for(self, run_id: UUID) -> list[dict[str, object]]:
+        """Return the event timeline with only its safe persisted projection."""
+        self._require_run(run_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, event_type, payload_json, occurred_at
+                FROM coordination_events
+                WHERE run_id = ?
+                ORDER BY event_id ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [self._event_projection(row) for row in rows]
+
+    def _load(self, run_id: UUID) -> CoordinationRun:
+        self._require_database()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT run_json FROM coordination_runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        if row is None:
+            raise CoordinationRunNotFound(f"coordination run não encontrado: {run_id}")
+        return CoordinationRun.model_validate_json(str(row["run_json"]))
+
+    def _require_run(self, run_id: UUID) -> None:
+        self._require_database()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM coordination_runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        if row is None:
+            raise CoordinationRunNotFound(f"coordination run não encontrado: {run_id}")
+
+    def _require_database(self) -> None:
+        if not self._database_path.exists():
+            raise CoordinationRunNotFound("nenhum task board de coordenação foi persistido")
+
+    @staticmethod
+    def _event_projection(row: sqlite3.Row) -> dict[str, object]:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            safe_payload: dict[str, object] = {"available": False}
+        else:
+            safe_payload = {
+                key: payload[key]
+                for key in ("revision", "state", "scenario", "task_count")
+                if isinstance(payload, dict) and key in payload
+            }
+            safe_payload["available"] = bool(safe_payload)
+        return {
+            "event_id": row["event_id"],
+            "event_type": row["event_type"],
+            "occurred_at": row["occurred_at"],
+            "board": safe_payload,
+        }
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(f"file:{self._database_path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+
+def _optional_uuid(value: UUID | None) -> str | None:
+    return None if value is None else str(value)

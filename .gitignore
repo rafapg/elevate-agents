@@ -29,3 +29,4 @@ poc-pydanticai/
 .coverage
 coverage.xml
 htmlcov/
+docs/.DS_Store
