@@ -58,6 +58,46 @@ class EffectStatus(StrEnum):
     FAILED = "failed"
 
 
+class CoordinationScenario(StrEnum):
+    """The four deterministic coordination demonstrations."""
+
+    SUPERVISOR = "supervisor"
+    SPAWN = "spawn"
+    NO_SPAWN = "no-spawn"
+    CANCELLATION = "cancelamento"
+
+
+class CoordinationRunState(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class CoordinationTaskState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+
+
+class SubagentProfile(StrEnum):
+    SINGLE_INVESTIGATOR = "single_investigator"
+    CI_ANALYST = "ci_analyst"
+    CHANGE_ANALYST = "change_analyst"
+    LOG_ANALYST = "log_analyst"
+
+
+class CoordinationDecisionKind(StrEnum):
+    SUPERVISE = "supervise"
+    SPAWN = "spawn"
+    NO_SPAWN = "no_spawn"
+    AGGREGATE = "aggregate"
+    CANCEL = "cancel"
+    REJECT_LATE_RESULT = "reject_late_result"
+
+
 class Incident(DomainModel):
     incident_id: NonEmptyText
     title: NonEmptyText
@@ -79,6 +119,114 @@ class Evidence(EvidenceRef):
     summary: NonEmptyText
     excerpt: str | None = Field(default=None, max_length=2_000)
     trust: Literal["observed", "reported", "derived"] = "observed"
+
+
+class EvidenceReport(DomainModel):
+    """A bounded, auditable response from one coordination task.
+
+    The report deliberately contains references and a short limitation, rather
+    than raw tool output.  It is safe to persist in the task board and lets the
+    aggregator evaluate coverage without asking a model to interpret policy.
+    """
+
+    report_id: UUID = Field(default_factory=uuid4)
+    task_id: UUID
+    expected_revision: Annotated[int, Field(ge=0)]
+    evidence: tuple[EvidenceRef, ...] = Field(min_length=1)
+    provenance: NonEmptyText
+    limitation: NonEmptyText
+    coverage: tuple[NonEmptyText, ...] = Field(min_length=1)
+    completed_at: datetime
+
+    @model_validator(mode="after")
+    def evidence_and_coverage_are_not_duplicated(self) -> EvidenceReport:
+        evidence_ids = [item.evidence_id for item in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("um report não pode repetir a mesma evidência")
+        if len(self.coverage) != len(set(self.coverage)):
+            raise ValueError("um report não pode repetir cobertura")
+        return self
+
+
+class CoordinationTask(DomainModel):
+    """One read-only unit of work assigned to a fixed subagent profile."""
+
+    task_id: UUID = Field(default_factory=uuid4)
+    profile: SubagentProfile
+    read_scope: tuple[NonEmptyText, ...] = Field(min_length=1)
+    budget_steps: Annotated[int, Field(ge=1, le=6)]
+    deadline: datetime
+    depends_on: tuple[UUID, ...] = ()
+    expected_revision: Annotated[int, Field(ge=0)]
+    # This revision belongs to the task, not to the whole board.  A worker may
+    # finish after another task advanced the board and still be current.
+    revision: Annotated[int, Field(ge=0)] = 0
+    status: CoordinationTaskState = CoordinationTaskState.PENDING
+    result: EvidenceReport | None = None
+
+    @model_validator(mode="after")
+    def is_a_coherent_task(self) -> CoordinationTask:
+        if len(self.read_scope) != len(set(self.read_scope)):
+            raise ValueError("read_scope não pode repetir uma fonte")
+        if self.task_id in self.depends_on:
+            raise ValueError("uma tarefa não pode depender de si mesma")
+        if len(self.depends_on) != len(set(self.depends_on)):
+            raise ValueError("depends_on não pode repetir uma tarefa")
+        if self.status is CoordinationTaskState.COMPLETED and self.result is None:
+            raise ValueError("tarefa completed exige um EvidenceReport")
+        if self.status is not CoordinationTaskState.COMPLETED and self.result is not None:
+            raise ValueError("somente tarefa completed pode conter um EvidenceReport")
+        if self.result is not None and self.result.task_id != self.task_id:
+            raise ValueError("EvidenceReport deve pertencer à própria tarefa")
+        if self.result is not None and self.result.expected_revision != self.expected_revision:
+            raise ValueError("EvidenceReport deve declarar o token de despacho da tarefa")
+        return self
+
+
+class CoordinationDecision(DomainModel):
+    """A deterministic coordination decision with its human-readable reason."""
+
+    kind: CoordinationDecisionKind
+    reason: NonEmptyText
+    task_id: UUID | None = None
+
+
+class CoordinationRun(DomainModel):
+    """The durable task board for one offline coordination demonstration."""
+
+    schema_version: Literal[1] = 1
+    run_id: UUID = Field(default_factory=uuid4)
+    scenario: CoordinationScenario
+    state: CoordinationRunState = CoordinationRunState.RUNNING
+    revision: Annotated[int, Field(ge=0)] = 0
+    budget_steps: Annotated[int, Field(ge=1, le=6)] = 6
+    spent_steps: Annotated[int, Field(ge=0)] = 0
+    reserved_steps: Annotated[int, Field(ge=0)] = 0
+    deadline: datetime
+    coverage_target: Annotated[int, Field(ge=1)] = 2
+    tasks: tuple[CoordinationTask, ...] = ()
+    decision: CoordinationDecision | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def is_a_coherent_coordination_run(self) -> CoordinationRun:
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at não pode anteceder created_at")
+        if self.spent_steps + self.reserved_steps > self.budget_steps:
+            raise ValueError("passos gastos e reservados não podem exceder budget_steps")
+        task_ids = [task.task_id for task in self.tasks]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("task_id deve ser único por run")
+        known_task_ids = set(task_ids)
+        for task in self.tasks:
+            if task.deadline > self.deadline:
+                raise ValueError("deadline da tarefa não pode exceder o deadline do run")
+            if not set(task.depends_on).issubset(known_task_ids):
+                raise ValueError("depends_on deve referenciar uma tarefa do mesmo run")
+        if self.state is CoordinationRunState.COMPLETED and self.decision is None:
+            raise ValueError("run completed exige uma decisão final")
+        return self
 
 
 class HypothesisDraft(DomainModel):

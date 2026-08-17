@@ -76,7 +76,11 @@ class JsonlTraceSink:
 
 
 class LangfuseTraceSink:
-    """Thin Langfuse adapter. It must be used behind ``CompositeTraceSink``."""
+    """Best-effort Langfuse adapter used behind ``CompositeTraceSink``.
+
+    Coordination events use a real remote root retained until ``flush``;
+    PydanticAI still owns native LLM and tool instrumentation.
+    """
 
     def __init__(
         self, settings: TraceSettings, *, redactor: TraceRedactor, client: Any | None = None
@@ -95,9 +99,45 @@ class LangfuseTraceSink:
             environment=settings.environment,
             release=settings.langfuse_release,
         )
+        # A coordination run is exported as one real remote root with task-board
+        # transitions below it.  Local ``span_id`` values are audit metadata;
+        # Langfuse owns remote observation IDs, so they must not be presented as
+        # remote parent IDs.
+        self._coordination_roots: dict[str, Any] = {}
 
     def emit(self, event: TraceEvent) -> None:
         sanitized = self._redactor.redact_event(event)
+        metadata = _metadata(sanitized)
+        if sanitized.event_type == "coordination.run.started":
+            root = self._client.start_observation(
+                trace_context={"trace_id": sanitized.trace_id},
+                name=sanitized.event_type,
+                as_type="span",
+                metadata=metadata,
+            )
+            self._coordination_roots[sanitized.trace_id] = root
+            return
+        if sanitized.event_type.startswith("coordination."):
+            root = self._coordination_roots.get(sanitized.trace_id)
+            if root is not None:
+                observation = root.start_observation(
+                    name=sanitized.event_type,
+                    as_type="span",
+                    metadata=metadata,
+                )
+                observation.end()
+                return
+            # Preserve the event even if a caller did not emit the root. Do
+            # not attach it to a synthetic local span ID that Langfuse never
+            # created.
+            observation = self._client.start_observation(
+                trace_context={"trace_id": sanitized.trace_id},
+                name=sanitized.event_type,
+                as_type="span",
+                metadata=metadata,
+            )
+            observation.end()
+            return
         trace_context: TraceContext = {"trace_id": sanitized.trace_id}
         if sanitized.parent_span_id is not None:
             trace_context["parent_span_id"] = sanitized.parent_span_id
@@ -105,20 +145,14 @@ class LangfuseTraceSink:
             trace_context=trace_context,
             name=sanitized.event_type,
             as_type="span",
-            metadata={
-                "event_id": str(sanitized.event_id),
-                "span_id": sanitized.span_id,
-                "run_id": str(sanitized.run_id) if sanitized.run_id else None,
-                "session_id": sanitized.session_id,
-                "workflow_name": sanitized.workflow_name,
-                "workflow_version": sanitized.workflow_version,
-                "status": sanitized.status,
-                "attributes": sanitized.attributes,
-            },
+            metadata=metadata,
         )
         observation.end()
 
     def flush(self) -> None:
+        for root in self._coordination_roots.values():
+            root.end()
+        self._coordination_roots.clear()
         self._client.flush()
 
 
@@ -198,3 +232,18 @@ def _failure_event(reason: str, *, context: TraceEvent | None = None) -> TraceEv
         status="error",
         attributes={"reason": reason},
     )
+
+
+def _metadata(event: TraceEvent) -> dict[str, object]:
+    """Keep local audit identifiers as metadata, never remote parent IDs."""
+
+    return {
+        "event_id": str(event.event_id),
+        "span_id": event.span_id,
+        "run_id": str(event.run_id) if event.run_id else None,
+        "session_id": event.session_id,
+        "workflow_name": event.workflow_name,
+        "workflow_version": event.workflow_version,
+        "status": event.status,
+        "attributes": event.attributes,
+    }

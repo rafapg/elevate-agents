@@ -9,6 +9,7 @@ import json
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
 from uuid import UUID
 
 from aula12_agents.agent.deps import AgentDeps, AgentPolicy, CriticDeps
@@ -29,7 +30,11 @@ from aula12_agents.infrastructure.agent_executor import (
     PydanticAICriticExecutor,
 )
 from aula12_agents.infrastructure.fixtures import FixtureGateway, FixtureReader
-from aula12_agents.infrastructure.persistence import CheckpointNotFound, SQLitePersistence
+from aula12_agents.infrastructure.persistence import (
+    CheckpointNotFound,
+    CoordinationRunNotFound,
+    SQLitePersistence,
+)
 from aula12_agents.infrastructure.providers import build_model
 from aula12_agents.infrastructure.trace import (
     ObservabilityBootstrap,
@@ -37,8 +42,37 @@ from aula12_agents.infrastructure.trace import (
     WorkflowTraceObserver,
     build_observability,
 )
-from aula12_agents.interfaces.inspection import LocalRunInspector
+from aula12_agents.interfaces.inspection import CoordinationRunInspector, LocalRunInspector
 from aula12_agents.settings import LabSettings, load_settings
+
+COORDINATION_SCENARIOS = ("supervisor", "spawn", "no-spawn", "cancelamento")
+
+
+class CoordinationRunView(Protocol):
+    """Fields the CLI is allowed to project from a coordination run."""
+
+    run_id: object
+    scenario: object
+    state: object
+    revision: int
+    decision: object
+    tasks: tuple[CoordinationTaskView, ...]
+
+
+class CoordinationTaskView(Protocol):
+    """Task fields suitable for a redacted terminal summary."""
+
+    task_id: object
+    profile: object
+    status: object
+    budget_steps: int
+    result: object | None
+
+
+class CoordinationCoordinatorView(Protocol):
+    """Narrow application port used by the command-line composition root."""
+
+    async def run(self, scenario: object) -> CoordinationRunView: ...
 
 
 class LocalRetryScheduler:
@@ -123,6 +157,22 @@ def build_parser() -> argparse.ArgumentParser:
         "show-trace", help="show redacted local JSONL trace events; no Langfuse connection is made"
     )
     trace.add_argument("run_id", type=UUID)
+    coordination = subcommands.add_parser(
+        "coordination", help="run an offline reference scenario for subagent coordination"
+    )
+    coordination_commands = coordination.add_subparsers(dest="coordination_command", required=True)
+    coordination_run = coordination_commands.add_parser(
+        "run", help="run a deterministic coordination scenario with local fixtures"
+    )
+    coordination_run.add_argument("scenario", choices=COORDINATION_SCENARIOS)
+    coordination_board = coordination_commands.add_parser(
+        "show-board", help="show a persisted coordination task board without changing it"
+    )
+    coordination_board.add_argument("run_id", type=UUID)
+    coordination_events = coordination_commands.add_parser(
+        "show-events", help="show a persisted coordination event timeline without changing it"
+    )
+    coordination_events.add_argument("run_id", type=UUID)
     return parser
 
 
@@ -140,6 +190,9 @@ async def dispatch(args: argparse.Namespace, settings: LabSettings) -> dict[str,
                 database_path=settings.run_db_path, trace_dir=settings.trace_dir
             ).list_runs()
         }
+
+    if args.command == "coordination":
+        return await _dispatch_coordination(args, settings)
 
     store = SQLitePersistence(settings.run_db_path)
     if args.command == "show-run":
@@ -181,6 +234,113 @@ async def dispatch(args: argparse.Namespace, settings: LabSettings) -> dict[str,
         "state": checkpoint.state.value,
         "revision": checkpoint.revision,
         "next_step": checkpoint.next_step,
+    }
+
+
+async def _dispatch_coordination(
+    args: argparse.Namespace, settings: LabSettings
+) -> dict[str, object]:
+    """Compose the separate coordination workflow at the CLI boundary.
+
+    Imports are intentionally local: the linear laboratory remains usable while
+    the reference coordination implementation evolves independently.
+    """
+
+    if args.coordination_command == "show-board":
+        return CoordinationRunInspector(database_path=settings.run_db_path).task_board(args.run_id)
+    if args.coordination_command == "show-events":
+        return {
+            "run_id": str(args.run_id),
+            "events": CoordinationRunInspector(database_path=settings.run_db_path).events_for(
+                args.run_id
+            ),
+        }
+
+    from aula12_agents.domain.models import CoordinationScenario
+
+    coordinator, observability = _build_coordination_coordinator(settings)
+    try:
+        run = await coordinator.run(CoordinationScenario(args.scenario))
+    finally:
+        observability.sink.flush()
+    return _coordination_run_projection(run)
+
+
+def _build_coordination_coordinator(
+    settings: LabSettings,
+) -> tuple[CoordinationCoordinatorView, ObservabilityBootstrap]:
+    """Build the coordination use case once its concrete adapters are available.
+
+    This seam belongs at the interface boundary. The integration owner wires
+    the SQLite store, local fixture reader and JSONL observer here; no domain
+    or application module receives ``LabSettings``.
+    """
+
+    from aula12_agents.application.coordination import (
+        CoordinationCoordinator,
+        CoordinationFixtureReader,
+    )
+    from aula12_agents.application.coordination_executor import CoordinationSpecialistExecutor
+    from aula12_agents.infrastructure.fixtures import FixtureReader
+    from aula12_agents.infrastructure.persistence import SQLiteCoordinationStore
+    from aula12_agents.infrastructure.trace import CoordinationTraceObserver
+
+    observability = build_observability(settings.trace_settings())
+    store = SQLiteCoordinationStore(settings.run_db_path)
+    specialist: CoordinationSpecialistExecutor | None = None
+    if settings.model_provider != "mock":
+        model = observability.instrument_pydantic_ai_model(
+            build_model(settings.provider_settings())
+        )
+        if settings.model_provider == "ollama":
+            from aula12_agents.infrastructure.coordination_ollama import OllamaCoordinationExecutor
+
+            specialist = OllamaCoordinationExecutor(
+                model=model,
+                maximum_timeout_seconds=settings.ollama_coordination_timeout_seconds,
+            )
+        else:
+            from aula12_agents.infrastructure.coordination_openrouter import (
+                OpenRouterCoordinationExecutor,
+            )
+
+            specialist = OpenRouterCoordinationExecutor(model=model)
+    coordinator = CoordinationCoordinator(
+        store=store,
+        events=store,
+        reader=cast(CoordinationFixtureReader, FixtureReader()),
+        observer=CoordinationTraceObserver(
+            sink=observability.sink,
+            workflow_name="aula12-agents-coordination",
+            environment=settings.langfuse_environment,
+        ),
+        specialist=specialist,
+        run_timeout_seconds=settings.coordination_run_timeout_seconds,
+        now=lambda: datetime.now(UTC),
+    )
+    return cast(CoordinationCoordinatorView, coordinator), observability
+
+
+def _coordination_run_projection(run: CoordinationRunView) -> dict[str, object]:
+    """Return the stable, export-safe summary shown by ``coordination run``."""
+
+    decision = getattr(run.decision, "kind", run.decision)
+    return {
+        "run_id": str(run.run_id),
+        "scenario": str(run.scenario),
+        "state": str(run.state),
+        "revision": run.revision,
+        "decision": None if decision is None else str(decision),
+        "tasks": [
+            {
+                "task_id": str(task.task_id),
+                "profile": str(task.profile),
+                "status": str(task.status),
+                "budget_steps": task.budget_steps,
+                "result_available": task.result is not None,
+            }
+            for task in run.tasks
+        ],
     }
 
 
@@ -246,7 +406,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         result = await dispatch(args, load_settings())
-    except (CheckpointNotFound, ValueError) as error:
+    except (CheckpointNotFound, CoordinationRunNotFound, ValueError) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, default=str))
